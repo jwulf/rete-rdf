@@ -1,0 +1,462 @@
+/*
+ * To change this template, choose Tools | Templates
+ * and open the template in the editor.
+ */
+
+package nodes;
+
+/**
+ *
+ * @author David Monks, dm11g08
+ * @version 1.5
+ */
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Queue;
+import java.util.Random;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import org.jivesoftware.smack.*;
+import org.jivesoftware.smack.filter.PacketFilter;
+import org.jivesoftware.smack.packet.Message;
+import org.jivesoftware.smack.packet.Packet;
+import org.jivesoftware.smack.packet.Presence;
+import org.jivesoftware.smack.packet.RosterPacket;
+
+import rdf.DualTimeQuad;
+import rdf.RDFPartException;
+import rdf.RDFTypeException;
+
+import rdf.Triple;
+import rdf.TuplePart;
+import rdf.UniTime;
+
+abstract public class RETENode implements Runnable {
+
+    private static int PACKET_SIZE = 0;
+    private static int PACKET_AGE = 0;
+    
+    //Producer/Consumer
+    private Map<String,Queue<Triple>> input;
+    private Queue<Triple> output;
+    private boolean running;
+    private Thread mainThread;
+    private Sender sendThread;
+    private long lastAdd;
+    
+    //XMPP
+    private String host;
+    private int port;
+    private String service;
+    private ConnectionConfiguration config;
+    private XMPPConnection conn;
+    private Roster roster;
+    private String name;
+    private String pass;
+    
+    //Publish/Subscribe
+    private List<Chat> listeners;
+    private Map<Chat,Boolean> sources;
+    
+    /**
+     * Creates a new RETE node.
+     */
+    public RETENode(String n,
+                    String h,
+                    String s,
+                    int po) throws XMPPException{
+        //Producer/Consumer
+        input = new HashMap<String,Queue<Triple>>();
+        output = new ArrayDeque<Triple>();
+        running = false;
+
+        //XMPP - DEBUG
+        System.setProperty("smack.debugEnabled", "true");
+        XMPPConnection.DEBUG_ENABLED = true;
+        
+        //XMPP
+        name = n;
+        pass = Long.toHexString((new Random()).nextLong());
+        host = h;
+        service = s;
+        port = po;
+        config = new ConnectionConfiguration(host, port,service);
+        conn = new XMPPConnection(config);
+        conn.addPacketListener(new SubscribeListener(),new SubscribeFilter());
+        conn.connect();
+        try{
+            conn.getAccountManager().createAccount(name, pass);
+        } catch (XMPPException ex){
+            System.out.println(ex.getMessage()+" on name "+name+", please manually deregister previous account before continuing.");
+            System.exit(1);
+        }
+        Runtime.getRuntime().addShutdownHook(new Thread(){
+            @Override
+            public void run(){
+                try {
+                    conn.getAccountManager().deleteAccount();
+                    conn.disconnect();
+                } catch (XMPPException ex) {
+                    System.out.println("Unable to deregister \""+name+"\"!  Manual deletion advised.");
+                }
+            }
+        });
+        conn.login(name,pass);
+        lastAdd = (new Date()).getTime();
+        
+        //Publish/Subscribe
+//        listeners = new ArrayList<Chat>();
+//        sources = new HashMap<Chat,Boolean>();
+        roster = conn.getRoster();
+        roster.setSubscriptionMode(Roster.SubscriptionMode.manual);
+        roster.addRosterListener(null);
+        roster.createGroup("sources");
+        roster.createGroup("listeners");
+    }
+    
+    protected void addStream(String stream,List<String> srcs) throws XMPPException{
+        input.put(stream, new ArrayDeque<Triple>());
+        for (String src : srcs) addSource(stream, src);
+    }
+    
+    public void addSource(String stream, String src) throws XMPPException{
+        String[] source = src.split(":");
+        if (source.length > 1 && stream.substring(0,1).equalsIgnoreCase(source[1].substring(0,1))){
+            String[] groups = {"sources"};
+            roster.createEntry(source[0], source[0].substring(0,source[0].indexOf("@")), groups);
+//            Chat chat = conn.getChatManager().createChat(source[0], new InputListener(input.get(stream)));
+//            synchronized(sources){
+//                sources.put(chat,false);
+//            }
+        }
+    }
+    
+    private class InputListener implements MessageListener {
+        
+        private Queue<Triple> in;
+        
+        public InputListener(Queue<Triple> stream){
+            in = stream;
+        }
+
+        public void processMessage(Chat chat, Message msg) {
+            Message message = new Message();
+//            if (msg.getProperty("RequestType") != null){
+//                if (msg.getProperty("RequestType").equals("confirm")){
+//                    synchronized(sources){
+//                        sources.put(chat, true);
+//                    }
+//                }else if (msg.getProperty("RequestType").equals("subscribe")){
+//                    synchronized(sources){
+//                        if (!sources.keySet().contains(chat)){
+//                            listeners.add(chat);
+//                            message.setProperty("RequestType", "confirm");
+//                            try {
+//                                chat.sendMessage(message);
+//                            } catch (XMPPException ex) {
+//                                System.out.println(ex.getMessage());
+//                            }
+//                            return;
+//                        }
+//                    }
+//                }
+//            }else synchronized(sources){
+//                sources.put(chat, true);
+//            }
+            List<Triple> triples;
+            try {
+                triples = Triple.listFromString(msg.getBody());
+//                triples = DualTimeQuad.listFromString(msg.getBody());
+            } catch (RDFTypeException ex) {
+                System.out.println(ex.getMessage());
+                triples = ex.getResults();
+            }
+            for (Triple triple : triples){
+                synchronized(in){
+                    in.offer(triple);
+                    in.notify();
+                }
+            }
+        }
+    }
+    
+    private class SubscribeListener implements PacketListener {
+        public void processPacket(Packet packet){
+            try {
+                String[] groups = {"listeners"};
+                String user = packet.getFrom();
+                roster.createEntry(user,user.substring(0,user.indexOf("@")),groups);
+    //            Message msg = (Message)packet;
+    //            Chat chat = conn.getChatManager().createChat(msg.getFrom(),msg.getThread(),null);
+    //            listeners.add(chat);
+    //            Message message = new Message();
+    //            message.setProperty("RequestType", "confirm");
+    //            try {
+    //                chat.sendMessage(message);
+    //            } catch (XMPPException ex) {
+    //            }
+    //            }
+            } catch (XMPPException ex) {
+                System.out.println(ex.getMessage());
+            }
+        }
+    }
+    
+    private class SubscribeFilter implements PacketFilter {
+        public boolean accept(Packet packet) {
+//            String reqType = (String)packet.getProperty("RequestType");
+//            return reqType != null
+//                && packet.getError() == null
+//                && packet instanceof Message
+//                && reqType.equalsIgnoreCase("subscribe");
+            return packet instanceof Presence
+                && ((Presence)packet).getType().equals(Presence.Type.subscribe);
+        }
+    }
+    
+    protected void sendData(Triple t){
+        synchronized(output){
+            output.offer(t);
+            if (output.size() > PACKET_SIZE)
+                output.notify();
+        }
+        lastAdd = (new Date()).getTime();
+    }
+    
+    protected long getLastSend(){
+        return lastAdd;
+    }
+    
+    abstract protected String formatTriple(Triple t)  throws RDFPartException, RDFTypeException;
+    
+    protected Triple retrieveData(String stream) throws InterruptedException{
+        Queue<Triple> in = input.get(stream);
+        synchronized(in){
+            while (in.isEmpty())
+                in.wait();
+            return in.poll();
+        }
+    }
+    
+    //Thread Based Operations
+    
+    public void start(){
+        running = true;
+        mainThread = new Thread(this);
+        sendThread = new Sender();
+        mainThread.start();
+        sendThread.start();
+        (new Thread(){
+            @Override
+            public void run(){
+                while (true){
+//                    synchronized(sources){
+//                        for (Chat chat : sources.keySet()){
+//                            if (!sources.get(chat)){
+//                                try {
+//                                    Message msg = new Message();
+//                                    msg.setProperty("RequestType", "subscribe");
+//                                    chat.sendMessage(msg);
+//                                } catch (XMPPException ex) {
+//                                    System.out.println(ex.getMessage());
+//                                }
+//                            }
+//                        }
+//                        if (!sources.containsValue(false)) break;
+//                    }
+                    for (RosterEntry entry : roster.getGroup("sources").getEntries()){
+                        if (entry.getStatus() == null){
+                            System.out.println("Null!");
+                        }else if (entry.getStatus().equals(RosterPacket.ItemStatus.SUBSCRIPTION_PENDING)){
+                            System.out.println("PENDING!");
+                        }
+                    }
+                    try {
+                        Thread.sleep(5000);
+                    } catch (InterruptedException ex) {
+                        System.out.println(ex.getMessage());
+                    }
+                }
+            }
+        }).start();
+    }
+    
+    public void stop(){
+        running = false;
+        boolean waiting = true;
+        while (waiting)
+            try {
+                mainThread.join();
+                sendThread.join();
+                waiting = false;
+            } catch (InterruptedException ex) {}
+    }
+    
+    public boolean isRunning(){
+        return running;
+    }
+    
+    public void run(){
+        while (running){
+            loop();
+        }
+    }
+    
+    abstract public void loop();
+    
+    private class Sender extends Thread {
+        @Override
+        public void run(){
+            while (running){
+                String msg = "";
+                synchronized(output){
+                    try {
+                        output.wait(PACKET_AGE);
+                    } catch (InterruptedException ex) {
+                        System.out.println(ex.getMessage());
+                    }
+                    if (output.size() > 0){
+                        Triple triple;
+                        while ((triple = output.poll()) != null){
+                            try{
+                                msg += formatTriple(triple);
+                            } catch (RDFPartException ex) {
+                                System.out.println(ex.getMessage());
+                            } catch (RDFTypeException ex) {
+                                System.out.println(ex.getMessage());
+                            }
+                        }
+                    }
+                }
+                try{
+                    if (!msg.equals("")){
+                        Message message = new Message();
+                        message.setBody(msg);
+//                        for (Chat stream : listeners){
+//                            stream.sendMessage(message);
+//                        }
+                        for (RosterEntry listener : roster.getGroup("liseners").getEntries()){
+                            if (roster.getPresence(listener.getUser()).isAvailable()){
+                                conn.getChatManager().createChat(listener.getUser(), null).sendMessage(message);
+                            }
+                        }
+                    }
+                } catch (XMPPException ex) {
+                    System.out.println(ex.getMessage());
+                }
+            }
+        }
+    }
+    
+    protected static class WindowQueue extends PriorityQueue {
+        
+        private static final int SIZE = 100;
+        
+        private boolean sizeLimited;
+        private long limit;
+        
+        public WindowQueue(boolean sizeCapped,long cap){
+            this(SIZE,sizeCapped,cap);
+        }
+        
+        public WindowQueue(int size,boolean sizeCapped,long cap){
+            super(size,new java.util.Comparator(){
+                public int compare(Object o1, Object o2) {
+                    if (o1 instanceof UniTime && o2 instanceof UniTime)
+                        return (int)(((UniTime)o1).getTime()
+                                   - ((UniTime)o2).getTime());
+                    return 0;
+                }
+            });
+            sizeLimited = sizeCapped;
+            limit = cap;
+        }
+        
+        @Override
+        public boolean offer(Object ob){
+            if (ob instanceof Triple){
+                Triple t;
+                if (ob instanceof UniTime){
+                    t = (Triple) ob;
+                }else{
+                    t = new TimeStampedTriple((Triple)ob);
+                }
+                return super.offer(t);
+            }
+            return false;
+        }
+        
+        @Override
+        public Object poll(){
+            Object ob = super.poll();
+            if (ob instanceof TimeStampedTriple) return ((TimeStampedTriple)ob).extract();
+            return ob;
+        }
+        
+        public boolean combine(Triple t){
+            Iterator<Triple> it = iterator();
+            while (it.hasNext()){
+                Triple o = it.next();
+                if (t.combine(o)){
+                    remove(o);
+                    return offer(t);
+                }
+            }
+            return false;
+        }
+        
+        public boolean prune(){
+            boolean pruned = false;
+            if (sizeLimited){
+                while (size() > limit){
+                    poll();
+                    pruned = true;
+                }
+            }else{
+                long now = (new Date()).getTime();
+                while (now - ((UniTime)peek()).getTime() > limit){
+                    poll();
+                    pruned = true;
+                }
+            }
+            return pruned;
+        }
+        
+        private static class TimeStampedTriple extends Triple implements UniTime {
+
+            private long time;
+            
+            public TimeStampedTriple(Triple t){
+                super(t.getSubject(),t.getPredicate(),t.getObject());
+                time = (new Date()).getTime();
+            }
+            
+            public Triple extract(){
+                return new Triple(getSubject(),getPredicate(),getObject());
+            }
+            
+            public long getTime() {
+                return time;
+            }
+
+            public String timeToRDF() throws RDFPartException, RDFTypeException {
+                return partToRDF(TuplePart.EMISSION_TIME);
+            }
+
+            public String timeToXMLRDF() throws RDFPartException, RDFTypeException {
+                return partToXMLRDF(TuplePart.EMISSION_TIME);
+            }
+            
+        }
+        
+    }
+    
+}

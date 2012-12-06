@@ -1,0 +1,235 @@
+/*
+ * To change this template, choose Tools | Templates
+ * and open the template in the editor.
+ */
+
+package nodes;
+
+/**
+ *
+ * @author David Monks, dm11g08
+ * @version 1.5
+ */
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Random;
+
+import org.jivesoftware.smack.ConnectionConfiguration;
+import org.jivesoftware.smack.PacketListener;
+import org.jivesoftware.smack.XMPPConnection;
+import org.jivesoftware.smack.XMPPException;
+import org.jivesoftware.smack.packet.Message;
+import org.jivesoftware.smack.packet.Packet;
+import org.jivesoftware.smackx.Form;
+import org.jivesoftware.smackx.muc.MultiUserChat;
+
+import rdf.RDFPartException;
+import rdf.RDFTypeException;
+
+import rdf.Triple;
+
+abstract public class RETENodeGroup implements Runnable {
+
+    private static int PACKET_SIZE = 1;
+    private static long PACKET_AGE = 0;
+    
+    //Producer/Consumer
+    private Map<String,Queue<Triple>> input;
+    private Queue<Triple> output;
+    private boolean running;
+    private Thread thread;
+    
+    private long lastSend = 0;
+    
+    //XMPP
+    private String host;
+    private int port;
+    private String service;
+    private ConnectionConfiguration config;
+    private XMPPConnection conn;
+    private String name;
+    private String pass;
+    private MultiUserChat outStream;
+    
+    //Sources
+    private List<MultiUserChat> sources;
+    
+    /**
+     * Creates a new RETE node.
+     */
+    public RETENodeGroup(String n,
+                    String h,
+                    String s,
+                    int po) throws XMPPException{
+        //Producer/Consumer
+        input = new HashMap<String,Queue<Triple>>();
+        output = new ArrayDeque<Triple>();
+        running = false;
+        
+        //XMPP - DEBUG
+        System.setProperty("smack.debugEnabled", "true");
+        XMPPConnection.DEBUG_ENABLED = true;
+        
+        //XMPP
+        pass = Integer.toHexString((new Random()).nextInt(3200000));
+        name = n;
+        host = h;
+        service = s;
+        port = po;
+        
+        sources = new ArrayList<MultiUserChat>();
+        
+        config = new ConnectionConfiguration(host, port, service);
+        
+        conn = new XMPPConnection(config);
+        conn.connect();
+        conn.getAccountManager().createAccount(name, pass);
+        Runtime.getRuntime().addShutdownHook(new Thread(){
+            @Override
+            public void run(){
+                if (conn.isAuthenticated()){
+                    try {
+                        for (MultiUserChat source : sources)
+                            source.leave();
+                        outStream.leave();
+                        conn.getAccountManager().deleteAccount();
+                        conn.disconnect();
+                    } catch (XMPPException ex) {
+                        System.out.println("User \""+name+"\" was not deregistered!  Requires manual deregistering.");
+                    }
+                }
+            }
+        });
+        conn.login(name,pass);
+        
+        outStream = new MultiUserChat(conn,name+"@stream."+service);
+        try {
+            outStream.join(name);
+        } catch (XMPPException ex) {
+            outStream.create(name);
+            outStream.sendConfigurationForm(new Form(Form.TYPE_SUBMIT));
+        }
+    }
+    
+    protected void addStream(String stream, List<String> srcs) throws XMPPException{
+        input.put(stream, new ArrayDeque<Triple>());
+        
+        if (srcs.size() > 0){
+            for (String source : srcs){
+                String[] temp = source.split("@");
+                if (temp[1].equals(service)){
+                    MultiUserChat muc = new MultiUserChat(conn,temp[0]+"@stream."+temp[1]);
+                    try {
+                        muc.join(name);
+                    } catch (XMPPException ex) {
+                        muc.create(name);
+                        muc.sendConfigurationForm(new Form(Form.TYPE_SUBMIT));
+                    }
+                    muc.addMessageListener(new PListener(stream));
+                    sources.add(muc);
+                }else{
+                    System.out.println("Help! I don't know what to do! Yours sincerely, RETENode Constructor.");
+                    System.exit(1);
+                }
+            }
+        }else{
+            System.out.println("Stream needs sources.  Cannot continue.");
+            System.exit(1);
+        }
+    }
+    
+    private class PListener implements PacketListener {
+        
+        private Queue stream;
+        
+        public PListener(String s){
+            stream = input.get(s);
+        }
+        
+        public void processPacket(Packet packet){
+            if (packet instanceof Message) {
+                Message msg = (Message) packet;
+                List<Triple> triples;
+                try {
+                    triples = Triple.listFromString(msg.getBody());
+                } catch (RDFTypeException ex) {
+                    System.out.println(ex.getMessage());
+                    triples = ex.getResults();
+                }
+                synchronized(RETENodeGroup.this){
+                    for (Triple triple : triples){
+                        stream.offer(triple);
+                        RETENodeGroup.this.notify();
+                    }
+                }
+            }
+        }
+    }
+    
+    protected void sendData(Triple t){
+        if (t != null) output.offer(t);
+        long time;
+        if (!output.isEmpty() && ((time = (new Date()).getTime()) - lastSend - PACKET_AGE > 0 || output.size() >= PACKET_SIZE)){
+            String msg = "";
+            Triple triple;
+            Message message = new Message();
+            while ((triple = output.poll()) != null){
+                try {
+                    msg += formatTriple(triple);
+                } catch (RDFPartException ex) {
+                    System.out.println(ex.getMessage());
+                } catch (RDFTypeException ex) {
+                    System.out.println(ex.getMessage());
+                }
+            }
+            message.setBody(msg);
+            try {
+                outStream.sendMessage(message);
+            } catch (XMPPException ex) {
+                System.out.println(ex.getMessage());
+            }
+            lastSend = time;
+        }
+    }
+    
+    abstract protected String formatTriple(Triple t)  throws RDFPartException, RDFTypeException;
+    
+    protected synchronized Triple retrieveData(String thread){
+        Queue<Triple> q = input.get(thread);
+        if (!q.isEmpty())
+            return q.poll();
+        else
+            return null;
+    }
+    
+    //Thread Based Operations
+    
+    public void start(){
+        running = true;
+        thread = new Thread(this);
+        thread.start();
+    }
+    
+    public void stop(){
+        running = false;
+        try {
+            thread.join();
+        } catch (InterruptedException ex) {}
+    }
+    
+    public void run(){
+        while (running){
+            loop();
+            sendData(null);
+        }
+    }
+    
+    abstract public void loop();
+    
+}

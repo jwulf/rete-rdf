@@ -1,0 +1,414 @@
+/*
+ * To change this template, choose Tools | Templates
+ * and open the template in the editor.
+ */
+
+package nodes;
+
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.PriorityQueue;
+import java.util.Queue;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import nodes.control.Comparator;
+import org.jivesoftware.smack.XMPPException;
+import rdf.DualTime;
+import rdf.DualTimeQuad;
+import rdf.Quadruple;
+import rdf.RDFPartException;
+import rdf.RDFType;
+import rdf.RDFTypeException;
+import rdf.Triple;
+import rdf.TuplePart;
+import rdf.UniTime;
+
+/**
+ *
+ * @author David Monks, dm11g08
+ * @version 1
+ */
+public class Join extends RETENode {
+    
+    private static final long DEFAULT_WINDOW_SIZE = 100;
+    
+    public static final String LEFT_STREAM = "left";
+    public static final String RIGHT_STREAM = "right";
+    public static final int LEFT = 1;
+    public static final int RIGHT = 2;
+    
+    private List<Condition> conditions;
+    private Template template;
+    
+    private Window left;
+    private Window right;
+    private Thread lThread;
+    private Thread rThread;
+    
+    public Join(String name,
+                String host,
+                String service,
+                int port,
+                List<String> sources,
+                List<Condition> cndtns,
+                Template t,
+                boolean leftSizeBased,
+                boolean rightSizeBased,
+                long leftWindowSize,
+                long rightWindowSize)throws XMPPException{
+        super(name,host,service,port);
+        template = t;
+        
+        List<String> lSources = new ArrayList<String>();
+        List<String> rSources = new ArrayList<String>();
+        for (String source : sources){
+            String[] temp = source.split(":");
+            if (temp[1].equalsIgnoreCase(LEFT_STREAM))
+                lSources.add(source);
+            if (temp[1].equalsIgnoreCase(RIGHT_STREAM))
+                rSources.add(source);
+        }
+        if (lSources.isEmpty()){
+            addStream(RIGHT_STREAM,rSources);
+            WindowQueue queue = new WindowQueue(rightSizeBased,rightWindowSize);
+            left = new Window(RIGHT_STREAM,LEFT,queue);
+            right = new Window(RIGHT_STREAM,LEFT,queue);
+        }else if (rSources.isEmpty()){
+            addStream(LEFT_STREAM,lSources);
+            WindowQueue queue = new WindowQueue(leftSizeBased,leftWindowSize);
+            left = new Window(LEFT_STREAM,LEFT,queue);
+            right = new Window(LEFT_STREAM,LEFT,queue);
+        }else{
+            addStream(LEFT_STREAM,lSources);
+            addStream(RIGHT_STREAM,rSources);
+            left = new Window(LEFT_STREAM,LEFT,leftSizeBased,leftWindowSize);
+            right = new Window(RIGHT_STREAM,RIGHT,rightSizeBased,rightWindowSize);
+        }
+        left.setPartner(right);
+        right.setPartner(left);
+        
+        conditions = cndtns;
+    }
+    
+    public Join(String name,
+                String host,
+                String service,
+                int port,
+                List<String> sources,
+                List<Condition> cndtns,
+                Template t) throws XMPPException{
+        this(name,
+             host,
+             service,
+             port,
+             sources,
+             cndtns,
+             t,
+             true,true,DEFAULT_WINDOW_SIZE,DEFAULT_WINDOW_SIZE);
+    }
+    
+    public Join(String name,
+                String host,
+                String service,
+                int port,
+                List<String> sources,
+                List<Condition> cndtns,
+                Template t,
+                boolean sizeBased,
+                long windowSize) throws XMPPException{
+        this(name,
+             host,
+             service,
+             port,
+             sources,
+             cndtns,
+             t,
+             sizeBased,sizeBased,
+             windowSize,windowSize);
+    }
+
+    @Override
+    protected String formatTriple(Triple t) throws RDFPartException, RDFTypeException {
+        return t.toRDF();
+    }
+    
+    @Override
+    public void start(){
+        super.start();
+        lThread = new Thread(left);
+        rThread = new Thread(right);
+        lThread.start();
+        rThread.start();
+    }
+    
+    @Override
+    public void stop(){
+        super.stop();
+        boolean waiting = true;
+        while (waiting)
+            try {
+                lThread.join();
+                rThread.join();
+                waiting = false;
+            } catch (InterruptedException ex) {}
+    }
+
+    @Override
+    public void loop() {
+        
+    }
+    
+    //Nested Classes
+    private class Window implements Runnable{
+        
+        private String stream;
+        private int side;
+        private WindowQueue window;
+        private Window other;
+        
+        public Window(String strm,int p,boolean sizeBased,long windowSize){
+            stream = strm;
+            side = p;
+            window = new WindowQueue(sizeBased,windowSize);
+            other = null;
+        }
+        
+        public Window(String strm,int p,WindowQueue w){
+            stream = strm;
+            side = p;
+            window = w;
+            other = null;
+        }
+        
+        public void setPartner(Window o){
+            other = o;
+        }
+
+        public void run() {
+            while (isRunning()){
+                try {
+                    Triple t;
+                    while ((t = retrieveData(stream)) == null) ;
+                    synchronized(Join.this){
+                        if (!window.combine(t)){
+                            try {
+                                other.join(t);
+                                if (other.window == window)
+                                    join(t);
+                                window.offer(t);
+                             /*
+                              * Drops triples that exceed the window capacity, as defined at the creation of the window.
+                              * Done here to maintain low window size after a change to its contents (commented out to reduce load on CPU, assuming system memory can cope with a few surplus triples).
+                              */
+//                                window.prune();
+                            } catch (RDFPartException ex) {
+                                System.out.println(ex.getMessage());
+                            }
+                        }
+                    }
+                } catch (InterruptedException ex) {
+                    System.out.println(ex.getMessage());
+                }
+            }
+        }
+        
+        protected boolean join(Triple o) throws RDFPartException{
+         /* 
+          * Drops triples that exceed the window capacity, as defined at the creation of the window.
+          * Done here so that the window is accurate at the time of the join.
+          */
+            window.prune();
+            boolean joined = false;
+            for (Object ob : window){
+                Triple t = (Triple) ob;
+                boolean join = true;
+                for (Condition cond : conditions)
+                    if (!(join = cond.check(t.getPart(cond.get(side)), side, o.getPart(cond.get((side == LEFT) ? RIGHT : LEFT)))))
+                        break;
+                if (join){
+                    try {
+                        sendData(template.apply(t,o,side));
+                        joined = true;
+                    } catch (RDFTypeException ex) {
+                        System.out.println("Template requests unavailable part of tuple: "+ex.getMessage());
+                    } catch (InputException ex) {
+                        System.out.println(ex.getMessage());
+                    }
+                }
+            }
+            return joined;
+        }
+        
+    }
+    
+    public static class Condition{
+        
+        private TuplePart first,second;
+        private Comparator comparator;
+        
+        public Condition(TuplePart f, Comparator c, TuplePart s){
+            first = f;
+            comparator = c;
+            second = s;
+        }
+        
+        public TuplePart get(int p) throws RDFPartException{
+            switch (p){
+                case LEFT:
+                    return first;
+                case RIGHT:
+                    return second;
+                default:
+                    throw new RDFPartException("Condition part must be Condition.FIRST or Condition.SECOND.");
+            }
+        }
+        
+        public boolean check(Object f,int p,Object s) throws RDFPartException{
+            switch (p){
+                case LEFT:
+                    return comparator.compare(f,s);
+                case RIGHT:
+                    return comparator.compare(s,f);
+                default:
+                    throw new RDFPartException("Condition part must be Condition.FIRST or Condition.SECOND.");
+            }
+        }
+        
+    }
+    
+    public static class Template{
+        
+        private TuplePart newSub,newPred,newOb;
+        private int subSrc,predSrc,obSrc;
+        
+        public Template(TuplePart p1,int t1,TuplePart p2,int t2,TuplePart p3,int t3) throws RDFPartException{
+            if (((p1 == null && (t1 != LEFT || t1 != RIGHT)) || (p1 != null && (t1 == LEFT || t1 == RIGHT)))
+             && ((p2 == null && (t2 != LEFT || t2 != RIGHT)) || (p2 != null && (t2 == LEFT || t2 == RIGHT)))
+             && ((p3 == null && (t3 != LEFT || t3 != RIGHT)) || (p3 != null && (t3 == LEFT || t3 == RIGHT)))){
+                newSub = p1;
+                subSrc = t1;
+                newPred = p2;
+                predSrc = t2;
+                newOb = p3;
+                obSrc = t3;
+            }else
+                throw new RDFPartException("For each template part P:T, both P and T must be 'null' or neither can be.  SHOULD NOT REACH HERE!");
+        }
+        
+        private Triple.Pair<Object,RDFType> extractPart(Triple t,TuplePart p) throws RDFTypeException{
+            switch (p){
+                case SUBJECT:
+                    return t.getSubject();
+                case PREDICATE:
+                    return t.getPredicate();
+                case OBJECT:
+                    return t.getObject();
+                case CONTEXT:
+                    if (t instanceof Quadruple)
+                        return ((Quadruple)t).getContext();
+                    else
+                        throw new RDFTypeException("Tuple type does not support Context or Graph data.");
+                case VALID_SINCE:
+                    if (t instanceof DualTime)
+                        return new Triple.Pair<Object,RDFType>(new Long(((DualTime)t).getValidTime()),RDFType.DATETIME);
+                    else
+                        throw new RDFTypeException("Tuple type does not support \"Valid Since\" Time Annotations.");
+                case EMISSION_TIME:
+                    if (t instanceof UniTime)
+                        return new Triple.Pair<Object,RDFType>(new Long(((UniTime)t).getTime()),RDFType.DATETIME);
+                    else
+                        throw new RDFTypeException("Tuple type does not support Time Annotations.");
+                default:
+                    System.out.println("Cannot have a blank part linked to a specific input stream.  SHOULD NOT GET HERE!");
+                    System.exit(1);
+            }
+            return null;
+        }
+        
+        public Triple apply(Triple t,Triple o,int part)
+                throws RDFTypeException, InputException, RDFPartException{
+            Triple newT;
+            Triple.Pair<Object,RDFType> sub,pred,ob;
+            switch (part){
+                case LEFT:
+                    switch (subSrc){
+                        case LEFT:
+                            sub = extractPart(t,newSub);break;
+                        case RIGHT:
+                            sub = extractPart(o,newSub);break;
+                        default:
+                            sub = new Triple.Pair<Object,RDFType>(Integer.toHexString(hashCode()),RDFType.BLANK);
+                    }
+                    switch (predSrc){
+                        case LEFT:
+                            pred = extractPart(t,newPred);break;
+                        case RIGHT:
+                            pred = extractPart(o,newPred);break;
+                        default:
+                            pred = new Triple.Pair<Object,RDFType>(Integer.toHexString(hashCode()),RDFType.BLANK);
+                    }
+                    switch (obSrc){
+                        case LEFT:
+                            ob = extractPart(t,newOb);break;
+                        case RIGHT:
+                            ob = extractPart(o,newOb);break;
+                        default:
+                            ob = new Triple.Pair<Object,RDFType>(Integer.toHexString(hashCode()),RDFType.BLANK);
+                    }
+                    break;
+                case RIGHT:
+                    switch (subSrc){
+                        case LEFT:
+                            sub = extractPart(o,newSub);break;
+                        case RIGHT:
+                            sub = extractPart(t,newSub);break;
+                        default:
+                            sub = new Triple.Pair<Object,RDFType>(Integer.toHexString(hashCode()),RDFType.BLANK);
+                    }
+                    switch (predSrc){
+                        case LEFT:
+                            pred = extractPart(o,newPred);break;
+                        case RIGHT:
+                            pred = extractPart(t,newPred);break;
+                        default:
+                            pred = new Triple.Pair<Object,RDFType>(Integer.toHexString(hashCode()),RDFType.BLANK);
+                    }
+                    switch (obSrc){
+                        case LEFT:
+                            ob = extractPart(o,newOb);break;
+                        case RIGHT:
+                            ob = extractPart(t,newOb);break;
+                        default:
+                            ob = new Triple.Pair<Object,RDFType>(Integer.toHexString(hashCode()),RDFType.BLANK);
+                    }
+                    break;
+                default:
+                    throw new InputException("SHOULD NOT REACH HERE!!");
+            }
+            if (t instanceof DualTimeQuad && o instanceof DualTimeQuad)
+                return new DualTimeQuad(sub,pred,ob,
+                                        (part == subSrc) ? (String)t.getPart(TuplePart.CONTEXT) : (String)o.getPart(TuplePart.CONTEXT),
+                                        Math.max(((Long)t.getPart(TuplePart.VALID_SINCE)).longValue(),((Long)o.getPart(TuplePart.VALID_SINCE)).longValue()),
+                                        Math.max(((Long)t.getPart(TuplePart.EMISSION_TIME)).longValue(),((Long)o.getPart(TuplePart.EMISSION_TIME)).longValue()));
+            else
+                return new Triple(sub,pred,ob);
+        }
+        
+    }
+    
+    public static class InputException extends Exception {
+        
+        public InputException(String message) {
+            super("Join iputs are either Join.LEFT or Join.RIGHT (integer 1 or 2 respectively). "+message);
+        }
+        
+        public InputException(){
+            this("");
+        }
+        
+    }
+}
+
+
